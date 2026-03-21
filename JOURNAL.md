@@ -257,4 +257,37 @@ Now compatible with both old and new NumPy versions.
 
 
 \---
+---
+
+## 2026-03-21 — Session 2: Data Layer Complete
+
+### What was built
+`data/fetcher.py` — Databento historical data fetcher with local cache.
+
+### Data pulled
+- MCL (Micro Crude Oil): 4,016 30-min bars, 2025-03-21 → 2026-03-20
+- MGC (Micro Gold): 2,511 30-min bars, 2025-03-21 → 2026-03-20
+- Source: Databento GLBX.MDP3, continuous contract (MCL.c.0, MGC.c.0)
+- Cost: $0.00 (included in Standard plan)
+- Cached locally as Parquet — not committed to Git
+
+### Key observations from the data
+- MCL price range: $54.98 → $104.56 (highly volatile year for crude)
+- MGC price range: $2,960 → $5,542 (gold all-time highs — strong trend)
+- Buy/sell volume split: ~49-50% (approximation method working correctly)
+- 3 degraded quality days flagged (rollovers + Thanksgiving) — noted for
+  backtest filter
+- MCL has more bars than MGC (4,016 vs 2,511) due to extended session
+  liquidity differences within 09:00-16:30 ET window
+
+### Data quality notes
+- BentoWarning on Sep 17, Sep 24, Nov 28 — degraded quality days
+- Will add degraded day filter in backtest runner
+- 1-min bars also cached locally for future reference
+
+### Next session
+Build backtest/runner.py — feed 12 months of bars through the signal
+engine bar by bar, simulate fills and commissions, output equity curve,
+win rate, avg R, max drawdown, and trades per day.
+
 
