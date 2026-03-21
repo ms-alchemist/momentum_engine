@@ -12,3 +12,6 @@ Thumbs.db
 venv/
 data/cache/
 *.parquet
+
+backtest/results/*.csv
+backtest/results/*.json
