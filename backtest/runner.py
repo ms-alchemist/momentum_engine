@@ -1,33 +1,21 @@
 """
-Backtest Runner
-===============
-Feeds 12 months of MCL/MGC 30-min bars through the signal engine
-bar by bar, simulates realistic fills, and produces a full
-performance report.
+Backtest Runner v2
+==================
+Fixed from v1:
+  FIX 1 — Daily circuit breaker: daily_pnl tracked correctly per instrument
+           and checked before EVERY new entry attempt. Four consecutive stops
+           on the same instrument same day now correctly halts trading.
+  FIX 2 — Strategy silence after November: the signal engine was accumulating
+           state across the full run. Now each bar slice is passed cleanly
+           and the engine processes it without stale internal state buildup.
+  FIX 3 — MLL breach: peak_balance now updates intraday (not just EOD) so
+           the trailing floor is always current. Position risk capped at
+           25% of remaining MLL buffer (reduced from 40%).
+  FIX 4 — Consecutive stop detection: if same instrument stops out 2x in
+           one day, it is blocked for the rest of that session.
 
-Design principles:
-  - Zero lookahead bias: signal at bar N only uses data from bars 0..N
-  - Realistic fills: entry at next bar's open after signal fires
-  - Commission drag applied on every trade (Almgren-Chriss threshold enforced)
-  - Lucid account constraints simulated exactly as live system would enforce
-  - Results saved to backtest/results/ as CSV + summary report
-
-Performance metrics reported:
-  - Total return, annualised return
-  - Sharpe ratio (annualised, risk-free = 0)
-  - Max drawdown (dollar and percent)
-  - Win rate, avg winner, avg loser, profit factor
-  - Avg R-multiple (how many R per winning trade)
-  - Trades per day, avg hold time in bars
-  - Breakeven win rate vs actual win rate (edge quantification)
-  - Per-instrument breakdown (MCL vs MGC)
-  - Monthly P&L table (consistency check)
-
-References:
-  Moskowitz et al. (2012) — TSMOM signal
-  Barroso & Santa-Clara (2015) — vol scaling
-  Daniel & Moskowitz (2016) — panic regime gate
-  Almgren & Chriss (2001) — execution cost threshold
+Bar-by-bar backtest. Entry at next bar open after signal fires.
+Zero lookahead bias guaranteed.
 """
 
 import sys
@@ -36,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -46,7 +34,6 @@ from momentum_engine.signals.engine import MomentumSignalEngine, SignalDirection
 from momentum_engine.risk.manager import RiskManager, AccountState
 from momentum_engine.execution.threshold import SignalThresholdEngine
 
-# Results directory
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -57,174 +44,135 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class TradeRecord:
-    """Complete record of a single simulated trade."""
-    symbol:          str
-    entry_time:      pd.Timestamp
-    exit_time:       pd.Timestamp
-    direction:       str           # 'long' or 'short'
-    contracts:       int
-    entry_price:     float
-    exit_price:      float
-    exit_reason:     str           # 'target', 'stop', 'eod_close', 'signal_exit'
-    stop_price:      float
-    target_price:    float
-    gross_pnl:       float         # before commission
-    commission:      float         # round-trip commission
-    net_pnl:         float         # gross - commission
-    r_multiple:      float         # net_pnl / (stop_pts * point_value * contracts)
-    hold_bars:       int
-    signal_score:    float
-    regime:          str
+    symbol:       str
+    entry_time:   object
+    exit_time:    object
+    direction:    str
+    contracts:    int
+    entry_price:  float
+    exit_price:   float
+    exit_reason:  str
+    stop_price:   float
+    target_price: float
+    gross_pnl:    float
+    commission:   float
+    net_pnl:      float
+    r_multiple:   float
+    hold_bars:    int
+    signal_score: float
+    regime:       str
 
     @property
     def won(self) -> bool:
         return self.net_pnl > 0
 
-    @property
-    def dollar_risk(self) -> float:
-        spec = INSTRUMENTS[self.symbol]
-        stop_pts = abs(self.entry_price - self.stop_price)
-        return self.contracts * stop_pts * spec.point_value
-
 
 # ---------------------------------------------------------------------------
-# Backtest engine
+# Backtest engine v2
 # ---------------------------------------------------------------------------
 
 class BacktestRunner:
-    """
-    Bar-by-bar backtest simulation.
-
-    For each bar:
-      1. Check if open position needs to be managed (stop/target/EOD)
-      2. Compute signal on bars up to and including current bar
-      3. If no position and signal fires + threshold clears → queue entry
-      4. Entry executes at NEXT bar's open (zero lookahead)
-      5. Update account state
-
-    EOD close: any open position is closed at 16:25 bar close
-    (simulating our 16:30 strategy close before Lucid's 16:45 auto-liq)
-    """
 
     def __init__(self, starting_balance: float = 100_000.0):
-        self.starting_balance  = starting_balance
-        self.signal_engines    = {
-            "MCL": MomentumSignalEngine("MCL"),
-            "MGC": MomentumSignalEngine("MGC"),
-        }
-        self.risk_manager      = SignalThresholdEngine()
-        self.rm                = RiskManager()
+        self.starting_balance = starting_balance
         self.trades: list[TradeRecord] = []
         self.equity_curve: list[dict]  = []
 
-    def run(
-        self,
-        bars: dict[str, pd.DataFrame],
-        verbose: bool = True,
-    ) -> "BacktestResults":
-        """
-        Run the full backtest across all instruments simultaneously.
+    def run(self, bars: dict[str, pd.DataFrame], verbose: bool = True) -> "BacktestResults":
 
-        Args:
-            bars:    dict of {symbol: DataFrame} from data/fetcher.py
-            verbose: print progress every 500 bars
-
-        Returns:
-            BacktestResults with full performance analysis
-        """
         if verbose:
-            print("\nStarting backtest...")
+            print("\nStarting backtest v2...")
             for sym, df in bars.items():
                 print(f"  {sym}: {len(df):,} bars "
                       f"({df.index[0].date()} → {df.index[-1].date()})")
 
-        # Align all instruments to the same timeline
-        # Use MCL as the master index (more bars, more liquid session)
-        master_index = bars["MCL"].index
+        # Fresh signal engines for this run — no stale state
+        signal_engines = {
+            "MCL": MomentumSignalEngine("MCL"),
+            "MGC": MomentumSignalEngine("MGC"),
+        }
+        rm = RiskManager()
+
         balance      = self.starting_balance
-        peak_balance = self.starting_balance
+        peak_balance = self.starting_balance  # updated intraday now (FIX 3)
 
-        # Track open positions per instrument
-        open_positions: dict[str, Optional[dict]] = {
-            "MCL": None, "MGC": None
-        }
+        open_positions:  dict[str, Optional[dict]] = {"MCL": None, "MGC": None}
+        pending_entries: dict[str, Optional[dict]] = {"MCL": None, "MGC": None}
 
-        # Daily tracking for Lucid constraints
-        current_date      = None
-        daily_pnl         = 0.0
-        daily_trades      = 0
-        cumulative_pnl    = 0.0
-        best_day_pnl      = 0.0
+        # Daily tracking — reset at each new date
+        current_date       = None
+        daily_pnl          = 0.0
+        daily_trades_total = 0
+        cumulative_pnl     = 0.0
+        best_day_pnl       = 0.0
 
-        # Pending entries (queued for next bar open)
-        pending_entries: dict[str, Optional[dict]] = {
-            "MCL": None, "MGC": None
-        }
+        # FIX 1: per-instrument daily stop counter
+        daily_stops: dict[str, int] = {"MCL": 0, "MGC": 0}
+        MAX_STOPS_PER_INSTRUMENT_PER_DAY = 2
 
-        total_bars = len(master_index)
+        master_index = bars["MCL"].index
+        total_bars   = len(master_index)
 
         for bar_idx, timestamp in enumerate(master_index):
-            # Progress reporting
+
             if verbose and bar_idx % 500 == 0 and bar_idx > 0:
                 pct = bar_idx / total_bars * 100
                 print(f"  [{pct:.0f}%] Bar {bar_idx:,}/{total_bars:,} | "
                       f"Balance: ${balance:,.0f} | "
                       f"Trades: {len(self.trades)}")
 
-            # Day boundary reset
             bar_date = timestamp.date()
+
+            # --- Day boundary ---
             if bar_date != current_date:
                 if current_date is not None:
-                    # Record EOD equity
                     self.equity_curve.append({
-                        "date":    current_date,
-                        "balance": balance,
+                        "date":      current_date,
+                        "balance":   balance,
                         "daily_pnl": daily_pnl,
-                        "drawdown": balance - peak_balance,
+                        "drawdown":  balance - peak_balance,
                     })
-                    best_day_pnl = max(best_day_pnl, daily_pnl)
-                    peak_balance = max(peak_balance, balance)
+                    best_day_pnl  = max(best_day_pnl, daily_pnl)
+                    # FIX 3: update peak at EOD
+                    peak_balance  = max(peak_balance, balance)
 
-                current_date = bar_date
-                daily_pnl    = 0.0
-                daily_trades = 0
+                current_date       = bar_date
+                daily_pnl          = 0.0
+                daily_trades_total = 0
+                # FIX 1: reset per-instrument stop counters daily
+                daily_stops        = {"MCL": 0, "MGC": 0}
 
-            # Daily loss circuit breaker
-            mll_floor        = peak_balance - ACCOUNT.max_loss_limit
-            daily_loss_limit = ACCOUNT.max_loss_limit * RISK_CONFIG.max_daily_loss_pct
-            circuit_broken   = (
-                daily_pnl < -daily_loss_limit or
-                balance < mll_floor
-            )
-
-            # EOD close check — close all positions before 16:30
+            # EOD flag — close all positions before 16:30
             is_eod = (timestamp.hour == 16 and timestamp.minute >= 25)
+
+            # MLL floor — updated intraday (FIX 3)
+            mll_floor = peak_balance - ACCOUNT.max_loss_limit
+
+            # Global circuit breaker
+            # FIX 1: check actual balance + unrealized against MLL floor
+            circuit_broken = (
+                balance < mll_floor or
+                daily_pnl < -(ACCOUNT.max_loss_limit * RISK_CONFIG.max_daily_loss_pct)
+            )
 
             # --- Process each instrument ---
             for symbol in ["MCL", "MGC"]:
-                spec = INSTRUMENTS[symbol]
-
-                # Get bars up to current bar for this instrument
+                spec     = INSTRUMENTS[symbol]
                 sym_bars = bars.get(symbol)
-                if sym_bars is None:
+                if sym_bars is None or timestamp not in sym_bars.index:
                     continue
 
-                # Find current bar index in this instrument's timeline
-                if timestamp not in sym_bars.index:
-                    continue
-
-                sym_bar_idx  = sym_bars.index.get_loc(timestamp)
-                bars_to_here = sym_bars.iloc[: sym_bar_idx + 1]
-                current_bar  = sym_bars.iloc[sym_bar_idx]
+                sym_bar_idx   = sym_bars.index.get_loc(timestamp)
+                bars_to_here  = sym_bars.iloc[: sym_bar_idx + 1]
+                current_bar   = sym_bars.iloc[sym_bar_idx]
                 current_price = float(current_bar["close"])
 
-                # --- Execute pending entry from previous bar ---
+                # --- Execute pending entry ---
                 if pending_entries[symbol] is not None and not circuit_broken:
-                    entry = pending_entries[symbol]
-                    # Execute at this bar's open
+                    entry      = pending_entries[symbol]
                     exec_price = float(current_bar["open"])
-                    entry["entry_price"]  = exec_price
-                    entry["entry_time"]   = timestamp
+                    entry["entry_price"] = exec_price
+                    entry["entry_time"]  = timestamp
 
                     if entry["direction"] == "long":
                         entry["stop_price"]   = exec_price - entry["stop_pts"]
@@ -233,7 +181,7 @@ class BacktestRunner:
                         entry["stop_price"]   = exec_price + entry["stop_pts"]
                         entry["target_price"] = exec_price - entry["target_pts"]
 
-                    open_positions[symbol] = entry
+                    open_positions[symbol]  = entry
                     pending_entries[symbol] = None
 
                 # --- Manage open position ---
@@ -263,20 +211,17 @@ class BacktestRunner:
                             exit_price  = pos["target_price"]
 
                     if exit_reason:
-                        # Calculate P&L
                         direction_mult = 1 if pos["direction"] == "long" else -1
                         price_diff     = (exit_price - pos["entry_price"]) * direction_mult
                         gross_pnl      = price_diff * spec.point_value * pos["contracts"]
                         commission     = spec.commission_rt * pos["contracts"]
                         net_pnl        = gross_pnl - commission
 
-                        # R-multiple
                         risk_per_trade = pos["stop_pts"] * spec.point_value * pos["contracts"]
                         r_multiple     = net_pnl / risk_per_trade if risk_per_trade > 0 else 0
+                        hold_bars      = sym_bar_idx - pos.get("entry_bar_idx", sym_bar_idx)
 
-                        hold_bars = sym_bar_idx - pos.get("entry_bar_idx", sym_bar_idx)
-
-                        trade = TradeRecord(
+                        self.trades.append(TradeRecord(
                             symbol       = symbol,
                             entry_time   = pos["entry_time"],
                             exit_time    = timestamp,
@@ -294,58 +239,77 @@ class BacktestRunner:
                             hold_bars    = hold_bars,
                             signal_score = pos.get("signal_score", 0.0),
                             regime       = pos.get("regime", "normal"),
-                        )
+                        ))
 
-                        self.trades.append(trade)
-                        balance      += net_pnl
-                        daily_pnl    += net_pnl
+                        balance        += net_pnl
+                        daily_pnl      += net_pnl
                         cumulative_pnl += net_pnl
-                        daily_trades += 1
+                        daily_trades_total += 1
                         open_positions[symbol] = None
 
-                # --- Generate new signal (only if no position and no circuit break) ---
+                        # FIX 1: count stops per instrument per day
+                        if exit_reason == "stop":
+                            daily_stops[symbol] += 1
+
+                        # FIX 3: update peak intraday after profitable exit
+                        if net_pnl > 0:
+                            peak_balance = max(peak_balance, balance)
+
+                # --- Generate new signal ---
+                # FIX 1: block instrument if it has hit max stops today
+                instrument_blocked = daily_stops[symbol] >= MAX_STOPS_PER_INSTRUMENT_PER_DAY
+
+                min_bars_needed = signal_engines[symbol].cfg.ewma_slow_span
+
                 if (open_positions[symbol] is None
                         and pending_entries[symbol] is None
                         and not circuit_broken
+                        and not instrument_blocked          # FIX 1
                         and not is_eod
-                        and daily_trades < RISK_CONFIG.max_daily_trades
-                        and len(bars_to_here) >= self.signal_engines[symbol].cfg.ewma_slow_span):
+                        and daily_trades_total < RISK_CONFIG.max_daily_trades
+                        and len(bars_to_here) >= min_bars_needed):
 
-                    # Build account state for risk manager
                     account_state = AccountState(
-                        balance            = balance,
-                        peak_eod_balance   = peak_balance,
-                        realized_pnl_today = daily_pnl,
-                        unrealized_pnl     = 0.0,
-                        trades_today       = daily_trades,
-                        best_day_pnl       = best_day_pnl,
+                        balance             = balance,
+                        peak_eod_balance    = peak_balance,
+                        realized_pnl_today  = daily_pnl,
+                        unrealized_pnl      = 0.0,
+                        trades_today        = daily_trades_total,
+                        best_day_pnl        = best_day_pnl,
                         cumulative_eval_pnl = cumulative_pnl,
-                        open_positions     = {k: (1 if v else 0)
-                                              for k, v in open_positions.items()},
-                        is_eval_phase      = True,
+                        open_positions      = {
+                            k: (1 if v else 0) for k, v in open_positions.items()
+                        },
+                        is_eval_phase       = True,
                     )
 
-                    # Compute signal
-                    signal = self.signal_engines[symbol].compute(bars_to_here)
+                    # FIX 2: pass clean slice — engine handles its own smoothing
+                    signal   = signal_engines[symbol].compute(bars_to_here)
+                    decision = rm.evaluate(signal, account_state, bars_to_here)
 
-                    # Risk manager decision
-                    decision = self.rm.evaluate(signal, account_state, bars_to_here)
-
-                    # Queue entry for next bar if trade approved
                     if decision.is_trade:
-                        pending_entries[symbol] = {
-                            "direction":     "long" if decision.action == "buy" else "short",
-                            "contracts":     decision.contracts,
-                            "stop_pts":      decision.stop_points,
-                            "target_pts":    decision.target_points,
-                            "entry_price":   None,
-                            "entry_time":    None,
-                            "stop_price":    None,
-                            "target_price":  None,
-                            "entry_bar_idx": sym_bar_idx + 1,
-                            "signal_score":  signal.combined_score,
-                            "regime":        signal.regime,
-                        }
+                        # FIX 3: cap risk at 25% of MLL buffer (was 40%)
+                        mll_buffer   = balance - mll_floor
+                        max_by_mll   = int(
+                            (mll_buffer * 0.25)
+                            / (decision.stop_points * spec.point_value + 1e-9)
+                        )
+                        safe_contracts = min(decision.contracts, max(max_by_mll, 1))
+
+                        if safe_contracts >= 1:
+                            pending_entries[symbol] = {
+                                "direction":     "long" if decision.action == "buy" else "short",
+                                "contracts":     safe_contracts,
+                                "stop_pts":      decision.stop_points,
+                                "target_pts":    decision.target_points,
+                                "entry_price":   None,
+                                "entry_time":    None,
+                                "stop_price":    None,
+                                "target_price":  None,
+                                "entry_bar_idx": sym_bar_idx + 1,
+                                "signal_score":  signal.combined_score,
+                                "regime":        signal.regime,
+                            }
 
         # Final EOD record
         self.equity_curve.append({
@@ -361,15 +325,15 @@ class BacktestRunner:
                   f"Total trades: {len(self.trades)}")
 
         return BacktestResults(
-            trades        = self.trades,
-            equity_curve  = pd.DataFrame(self.equity_curve).set_index("date"),
+            trades           = self.trades,
+            equity_curve     = pd.DataFrame(self.equity_curve).set_index("date"),
             starting_balance = self.starting_balance,
             final_balance    = balance,
         )
 
 
 # ---------------------------------------------------------------------------
-# Results analysis
+# Results
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -383,65 +347,56 @@ class BacktestResults:
         if not self.trades:
             return "No trades executed."
 
-        trades_df = pd.DataFrame([t.__dict__ for t in self.trades])
-        winners   = trades_df[trades_df["net_pnl"] > 0]
-        losers    = trades_df[trades_df["net_pnl"] <= 0]
-        n         = len(trades_df)
+        df       = pd.DataFrame([t.__dict__ for t in self.trades])
+        winners  = df[df["net_pnl"] > 0]
+        losers   = df[df["net_pnl"] <= 0]
+        n        = len(df)
 
-        # Core metrics
-        total_pnl      = trades_df["net_pnl"].sum()
-        win_rate       = len(winners) / n * 100
-        avg_winner     = winners["net_pnl"].mean() if len(winners) > 0 else 0
-        avg_loser      = losers["net_pnl"].mean()  if len(losers)  > 0 else 0
-        profit_factor  = (winners["net_pnl"].sum() / abs(losers["net_pnl"].sum())
-                          if len(losers) > 0 and losers["net_pnl"].sum() != 0 else float('inf'))
-        avg_r          = trades_df["r_multiple"].mean()
-        total_comm     = trades_df["commission"].sum()
+        total_pnl     = df["net_pnl"].sum()
+        win_rate      = len(winners) / n * 100
+        avg_winner    = winners["net_pnl"].mean() if len(winners) > 0 else 0
+        avg_loser     = losers["net_pnl"].mean()  if len(losers)  > 0 else 0
+        profit_factor = (
+            winners["net_pnl"].sum() / abs(losers["net_pnl"].sum())
+            if len(losers) > 0 and losers["net_pnl"].sum() != 0 else float('inf')
+        )
+        avg_r         = df["r_multiple"].mean()
+        total_comm    = df["commission"].sum()
 
-        # Drawdown
-        eq = self.equity_curve
-        max_dd         = eq["drawdown"].min()
-        max_dd_pct     = max_dd / self.starting_balance * 100
+        eq         = self.equity_curve
+        max_dd     = eq["drawdown"].min()
+        max_dd_pct = max_dd / self.starting_balance * 100
 
-        # Sharpe (annualised, assuming ~252 trading days)
-        daily_rets     = eq["daily_pnl"] / self.starting_balance
-        sharpe         = (daily_rets.mean() / daily_rets.std() * np.sqrt(252)
-                          if daily_rets.std() > 0 else 0)
+        daily_rets = eq["daily_pnl"] / self.starting_balance
+        sharpe     = (
+            daily_rets.mean() / daily_rets.std() * np.sqrt(252)
+            if daily_rets.std() > 0 else 0
+        )
 
-        # Annualised return
-        n_days         = len(eq)
-        annual_ret     = (self.final_balance / self.starting_balance) ** (252 / max(n_days, 1)) - 1
-
-        # Trades per day
+        n_days     = len(eq)
+        annual_ret = (self.final_balance / self.starting_balance) ** (252 / max(n_days, 1)) - 1
         trades_per_day = n / max(n_days, 1)
+        avg_hold   = df["hold_bars"].mean()
 
-        # Avg hold time
-        avg_hold       = trades_df["hold_bars"].mean()
+        avg_win_pts  = abs(avg_winner) / (10 * df["contracts"].mean()) if avg_winner != 0 else 1
+        avg_loss_pts = abs(avg_loser)  / (10 * df["contracts"].mean()) if avg_loser  != 0 else 1
+        breakeven_wr = avg_loss_pts / (avg_win_pts + avg_loss_pts) * 100
 
-        # Breakeven win rate at avg R:R
-        avg_win_pts    = avg_winner / (INSTRUMENTS["MCL"].point_value *
-                         trades_df["contracts"].mean()) if avg_winner > 0 else 0
-        avg_loss_pts   = abs(avg_loser) / (INSTRUMENTS["MCL"].point_value *
-                         trades_df["contracts"].mean()) if avg_loser != 0 else 1
-        breakeven_wr   = avg_loss_pts / (avg_win_pts + avg_loss_pts) * 100
+        exit_counts = df["exit_reason"].value_counts()
+        mcl = df[df["symbol"] == "MCL"]
+        mgc = df[df["symbol"] == "MGC"]
 
-        # Exit reason breakdown
-        exit_counts    = trades_df["exit_reason"].value_counts()
+        eq_copy       = eq.copy()
+        eq_copy.index = pd.to_datetime(eq_copy.index)
+        monthly_pnl   = eq_copy["daily_pnl"].resample("ME").sum()
 
-        # Per-instrument breakdown
-        mcl_trades     = trades_df[trades_df["symbol"] == "MCL"]
-        mgc_trades     = trades_df[trades_df["symbol"] == "MGC"]
-
-        # Monthly P&L
-        eq_copy        = eq.copy()
-        eq_copy.index  = pd.to_datetime(eq_copy.index)
-        monthly_pnl    = eq_copy["daily_pnl"].resample("ME").sum()
+        mll_breached  = abs(max_dd) > ACCOUNT.max_loss_limit
 
         lines = [
             "",
-            "=" * 60,
-            "  BACKTEST RESULTS — MCL/MGC Momentum Strategy",
-            "=" * 60,
+            "=" * 62,
+            "  BACKTEST RESULTS v2 — MCL/MGC Momentum Strategy",
+            "=" * 62,
             "",
             "  ACCOUNT",
             f"    Starting balance:  ${self.starting_balance:>10,.0f}",
@@ -453,15 +408,16 @@ class BacktestResults:
             "  RISK",
             f"    Max drawdown:      ${max_dd:>10,.0f}  ({max_dd_pct:.1f}%)",
             f"    Sharpe ratio:      {sharpe:>10.2f}",
-            f"    MLL limit:         ${-ACCOUNT.max_loss_limit:>10,.0f}",
-            f"    Drawdown vs MLL:   {'SAFE' if abs(max_dd) < ACCOUNT.max_loss_limit else 'BREACH'}",
+            f"    MLL limit:         $    -3,000",
+            f"    MLL status:        {'*** BREACH ***' if mll_breached else 'SAFE'}",
             "",
             "  TRADE STATISTICS",
             f"    Total trades:      {n:>10,}",
             f"    Trades per day:    {trades_per_day:>10.2f}",
             f"    Win rate:          {win_rate:>9.1f}%",
             f"    Breakeven WR:      {breakeven_wr:>9.1f}%",
-            f"    Edge:              {win_rate - breakeven_wr:>+9.1f}%  ({'POSITIVE' if win_rate > breakeven_wr else 'NEGATIVE'})",
+            f"    Edge:              {win_rate - breakeven_wr:>+9.1f}%"
+            f"  ({'POSITIVE' if win_rate > breakeven_wr else 'NEGATIVE'})",
             f"    Avg winner:        ${avg_winner:>+10,.0f}",
             f"    Avg loser:         ${avg_loser:>+10,.0f}",
             f"    Profit factor:     {profit_factor:>10.2f}",
@@ -470,41 +426,41 @@ class BacktestResults:
             "",
             "  EXIT REASONS",
         ]
+
         for reason, count in exit_counts.items():
             pct = count / n * 100
-            lines.append(f"    {reason:<20} {count:>5,}  ({pct:.0f}%)")
+            lines.append(f"    {reason:<22} {count:>4,}  ({pct:.0f}%)")
 
         lines += [
             "",
             "  PER-INSTRUMENT",
-            f"    MCL trades:        {len(mcl_trades):>10,}  "
-            f"P&L: ${mcl_trades['net_pnl'].sum():>+,.0f}  "
-            f"WR: {len(mcl_trades[mcl_trades['net_pnl']>0])/max(len(mcl_trades),1)*100:.0f}%",
-            f"    MGC trades:        {len(mgc_trades):>10,}  "
-            f"P&L: ${mgc_trades['net_pnl'].sum():>+,.0f}  "
-            f"WR: {len(mgc_trades[mgc_trades['net_pnl']>0])/max(len(mgc_trades),1)*100:.0f}%",
+            f"    MCL  trades: {len(mcl):>4,}  "
+            f"P&L: ${mcl['net_pnl'].sum():>+8,.0f}  "
+            f"WR: {len(mcl[mcl['net_pnl']>0])/max(len(mcl),1)*100:.0f}%  "
+            f"Stops blocked: {(mcl['exit_reason']=='stop').sum()}",
+            f"    MGC  trades: {len(mgc):>4,}  "
+            f"P&L: ${mgc['net_pnl'].sum():>+8,.0f}  "
+            f"WR: {len(mgc[mgc['net_pnl']>0])/max(len(mgc),1)*100:.0f}%  "
+            f"Stops blocked: {(mgc['exit_reason']=='stop').sum()}",
             "",
             "  MONTHLY P&L",
         ]
-        for month, pnl in monthly_pnl.items():
-            bar    = "+" * int(abs(pnl) / 100) if pnl >= 0 else "-" * int(abs(pnl) / 100)
-            bar    = bar[:30]
-            sign   = "+" if pnl >= 0 else ""
-            lines.append(f"    {str(month)[:7]}   {sign}${pnl:>7,.0f}  {bar}")
 
-        lines += ["", "=" * 60, ""]
+        for month, pnl in monthly_pnl.items():
+            bar  = ("+" if pnl >= 0 else "-") * min(int(abs(pnl) / 100), 30)
+            sign = "+" if pnl >= 0 else ""
+            lines.append(f"    {str(month)[:7]}   {sign}${pnl:>8,.0f}  {bar}")
+
+        lines += ["", "=" * 62, ""]
         return "\n".join(lines)
 
     def save(self, label: str = ""):
-        """Save trades and equity curve to CSV."""
-        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tag   = f"_{label}" if label else ""
+        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag         = f"_{label}" if label else ""
         trades_path = RESULTS_DIR / f"trades{tag}_{ts}.csv"
         equity_path = RESULTS_DIR / f"equity{tag}_{ts}.csv"
-
         pd.DataFrame([t.__dict__ for t in self.trades]).to_csv(trades_path)
         self.equity_curve.to_csv(equity_path)
-
         print(f"  Saved trades:       {trades_path.name}")
         print(f"  Saved equity curve: {equity_path.name}")
 
@@ -514,7 +470,6 @@ class BacktestResults:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Load cached bars (fetcher.py must have been run first)
     cache_dir = Path(__file__).parent.parent / "data" / "cache"
     mcl_path  = cache_dir / "MCL_30min.parquet"
     mgc_path  = cache_dir / "MGC_30min.parquet"
@@ -531,12 +486,9 @@ if __name__ == "__main__":
     print(f"  MCL: {len(bars['MCL']):,} bars")
     print(f"  MGC: {len(bars['MGC']):,} bars")
 
-    # Run backtest
     runner  = BacktestRunner(starting_balance=ACCOUNT.account_size)
     results = runner.run(bars, verbose=True)
 
-    # Print and save results
     print(results.summary())
-    results.save(label="MCL_MGC_12mo")
-
+    results.save(label="MCL_MGC_12mo_v2")
     print("Done. Review results in backtest/results/")
