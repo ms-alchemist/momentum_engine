@@ -37,6 +37,14 @@ Integrates all four research papers into a single, composable pipeline:
 Output: SignalOutput with a combined score in [-1, +1] and expected
         move magnitude in points (used by threshold engine).
 
+Changes in v3:
+  Fix B — Daily state reset: _signal_history is cleared at each new
+           trading day so stale smoothing values do not accumulate and
+           kill the signal over long runs (was causing silence after Nov).
+  Fix C — Signal threshold raised from 0.1 to 0.25 so only
+           higher-conviction signals generate entries, reducing the
+           proportion of trades that exit at EOD without resolution.
+
 All parameters in config/settings.py — nothing hardcoded here.
 """
 
@@ -119,6 +127,8 @@ class MomentumSignalEngine:
         self.spec = INSTRUMENTS[symbol]
         self.cfg = config or SIGNAL_CONFIG
         self._signal_history: list[float] = []
+        # Fix B: track the last bar date so we can reset history at day boundaries
+        self._last_bar_date = None
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -137,6 +147,13 @@ class MomentumSignalEngine:
         """
         if len(bars) < self.cfg.ewma_slow_span:
             return self._insufficient_data(bars)
+
+        # Fix B: reset smoothing history at each new trading day so stale
+        # values from previous sessions do not suppress the signal indefinitely.
+        bar_date = bars.index[-1].date()
+        if self._last_bar_date is not None and bar_date != self._last_bar_date:
+            self._signal_history = []
+        self._last_bar_date = bar_date
 
         closes = bars["close"]
         volumes = bars["volume"]
@@ -160,9 +177,11 @@ class MomentumSignalEngine:
         # Smooth to prevent signal flip-flopping (pseudomomentum conservation)
         combined = self._smooth_signal(combined)
 
+        # Fix C: threshold raised from 0.1 to 0.25 — only high-conviction
+        # signals generate entries, reducing low-quality EOD-close trades.
         direction = (
-            SignalDirection.LONG  if combined > 0.1 else
-            SignalDirection.SHORT if combined < -0.1 else
+            SignalDirection.LONG  if combined > 0.25 else
+            SignalDirection.SHORT if combined < -0.25 else
             SignalDirection.FLAT
         )
 
@@ -570,6 +589,9 @@ class MomentumSignalEngine:
         Apply exponential smoothing to prevent flip-flopping.
         Implements Bühler's pseudomomentum conservation: the signal should
         persist until a genuine dissipation event, not noise.
+
+        Note: _signal_history is reset at each new trading day (Fix B)
+        so stale values from previous sessions cannot suppress the signal.
         """
         self._signal_history.append(raw_signal)
         n = self.cfg.signal_smoothing_bars
