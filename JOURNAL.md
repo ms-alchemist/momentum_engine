@@ -291,3 +291,102 @@ engine bar by bar, simulate fills and commissions, output equity curve,
 win rate, avg R, max drawdown, and trades per day.
 
 
+---
+
+## 2026-03-21 — Session 3: Di Graziano Calibration + v4 Backtest Runner
+
+### Research added
+Di Graziano (2014) — Optimal Trading Stops and Algorithmic Trading.
+Full paper reviewed. Key findings applied:
+- Optimal stops derived by maximising expected discounted utility of P&L
+- P&L modelled as Markov modulated diffusion (signal-active state → noise state)
+- b/a ratio (target/stop) always > 1; grows with signal strength and signal life
+- Fast-decaying signals → tighter stops; slow-decaying signals → wider stops
+- Table 2 directly calibrated to MGC: normal regime stop 16pt, target 19pt
+- Independent validation: Di Graziano's 16pt stop converged with our empirical
+  90% survival threshold from session_test.py — two methods, same answer
+
+Di Graziano calibration results (digraziano_calibrate.py):
+- sigma (daily vol): 1.31% of price
+- mu1 (signal drift): 0.25% of price
+- Signal decay q (monthly): 0.066 (avg life 15.2 months — persistent signal)
+- Signal decay q (daily): 0.0031 (avg life 318 trading days)
+- Signal-to-noise ratio: 0.1879
+- Implied b/a ratio: 1.20:1
+- Di Graziano optimal stop: 15.7 pts → rounded to 16 pts
+- Di Graziano optimal target: 18.8 pts → rounded to 19 pts
+- Conservative EV: $44/contract/trade (vs earlier $65-78 estimate)
+
+### Signal audit findings (from signal_audit.py — previous session)
+- MCL dropped: avg daily range 1.64 pts, stop/target structurally unreachable
+- MGC kept: avg daily range 41.79 pts, 83% of days see >10pt range
+- First-bar accuracy: 58.3% (baseline 50%, target >55%) ✓
+- Autocorrelation: MGC mean-reverts at 30-min resolution
+  Lag 1 (30 min): -0.0417, Lag 2 (1 hr): -0.0296 → TSMOM layers add noise
+- Primary edge is first-bar directional prediction, not bar-level TSMOM
+- Monthly accuracy: Aug 71.4%, Apr 64.7%, Sep 65.1% (strong)
+  Mar 2026 45.0% (extreme vol, 63.7pt avg range — filtered out)
+
+### Files created this session
+- `digraziano_calibrate.py` — standalone calibration script
+- `signal_audit.py` — autocorrelation + monthly accuracy analysis
+- `session_test.py` — stop distance survival analysis
+- `backtest/runner_v4.py` — full v4 backtest with multi-contract comparison
+
+### v3 → v4 changes (complete list)
+
+**Instrument scope**
+  v3: MCL + MGC simultaneously
+  v4: MGC only — MCL daily range too small for stops/targets
+
+**Signal source**
+  v3: Full four-layer stack (intraday momentum, TSMOM, path signature,
+      vol regime proxy) evaluated on every bar throughout session
+  v4: Single signal — first 30-min bar direction (9:00-9:30 AM ET only)
+  Reason: MGC autocorrelation is mean-reverting at 30-min resolution.
+  TSMOM layers added noise. First-bar accuracy: 58.3% vs stack's 44-47%.
+
+**Stop and target levels**
+  v3: Fixed 10pt stop, 20pt target (both instruments)
+  v4: Di Graziano regime-adaptive (MGC only):
+      Low-vol  (<20pt daily range): stop 9pt,  target 12pt
+      Normal   (20-50pt range):     stop 16pt, target 19pt  ← primary
+      High-vol (>50pt range):       stop 22pt, target 26pt
+
+**Volatility filter**
+  v3: Session time filter (UTC 13:00-15:30, 19:00 entries only)
+  v4: Vol ratio filter — skip if 5-day avg range > 2.5× 20-day avg range
+  Effect: removes ~9% of extreme-vol days where win rate drops to 45%
+
+**MLL mechanics**
+  v3: Fixed $3,000 floor
+  v4: Exact Lucid trailing mechanics:
+      - Trails peak EOD balance at $3,000 below
+      - Locks permanently at $100,000 once balance reaches that level
+      - Buffer = current_balance - max($97,000, peak_EOD - $3,000)
+
+**Multi-contract comparison**
+  v3: Single contract size
+  v4: 1, 2, 3, 4 MGC contracts run simultaneously on identical trade sequence
+  Outputs per size: P&L, win rate, Sharpe, max drawdown, min MLL buffer,
+                    worst losing streak, consistency flags, days to $6k target
+
+**New reporting sections**
+  - Min MLL buffer seen during backtest
+  - Worst consecutive losing streak (days)
+  - Lucid consistency flag count (best day > 50% of cumulative P&L)
+  - Path to target: did each size hit $6,000 and in how many trading days
+  - Regime breakdown: P&L by low-vol / normal / high-vol regime
+  - Recommendation block: largest safe contract size + estimated eval timeline
+
+### Expected value (Di Graziano conservative estimate)
+  At 58.3% win rate, 19pt target, 16pt stop, $0.80 commission:
+  EV = 0.583 × $190 - 0.417 × $160 - $0.80 = $43.88/trade/contract
+  At ~1 trade/day, 20 trading days/month: ~$878/month at 1 contract
+
+### Next step
+Run: python backtest/runner_v4.py
+Review multi-contract comparison output, confirm MLL safety at 2-3 contracts,
+determine optimal contract size for fastest eval pass without MLL risk.
+Commit results to JOURNAL.md after running.
+
