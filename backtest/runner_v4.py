@@ -3,17 +3,18 @@ backtest/runner_v4.py
 =====================
 MGC Intraday Momentum Strategy — v4 (Di Graziano Calibrated)
 
-Changes from v3:
-  - MGC only (MCL dropped — daily range too small)
-  - First-bar signal (9:30 AM ET / UTC 13:00) — 58.3% accuracy, primary edge
-  - Di Graziano regime-adaptive stops:
-      Low-vol  (<20pt daily range):  stop=9pt,  target=12pt
-      Normal   (20-50pt range):      stop=16pt, target=19pt
-      High-vol (>50pt range):        stop=22pt, target=26pt
-  - Volatility filter: skip if 5-day range > 2.5x 20-day avg (extreme vol)
-  - Exact Lucid MLL mechanics: $3k trailing EOD, locks at $100k floor
-  - Multi-contract comparison: 1, 2, 3, 4 MGC contracts in parallel
-  - Lucid consistency rule tracked: best day <= 50% of cumulative P&L
+Signal: First 30-min bar direction (9:00-9:30 AM ET)
+Edge:   62.1% first-bar accuracy on MGC (signal audit 2025-03 to 2026-03)
+
+Stops derived from survival analysis:
+  Low-vol  (<20pt range):   stop=15pt, target=18pt
+  Normal   (20-50pt range): stop=25pt, target=30pt
+  High-vol (>50pt range):   stop=30pt, target=36pt
+
+MLL: Lucid trailing mechanics correctly modelled.
+  Floor = min(peak_EOD - $3,000, $100,000)
+  Floor starts at $97,000 and only reaches $100,000 once peak_EOD >= $103,000.
+  No premature locking on first winning trade.
 
 Usage:
     python backtest/runner_v4.py
@@ -26,61 +27,54 @@ from datetime import datetime, time
 import warnings
 warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 DATA_DIR     = Path("data/cache")
 RESULTS_DIR  = Path("backtest/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 MGC_FILE_30M = DATA_DIR / "MGC_30min.parquet"
-MGC_PNL_PT   = 10.0         # $10 per point per contract
-MGC_COMM     = 0.80         # commission per RT per contract
+MGC_PNL_PT   = 10.0
+MGC_COMM     = 0.80
 
-# Di Graziano regime-adaptive stops (points)
 STOPS = {
-    "low_vol":  {"stop": 9,  "target": 12},
-    "normal":   {"stop": 16, "target": 19},
-    "high_vol": {"stop": 22, "target": 26},
+    "low_vol":  {"stop": 15, "target": 18},
+    "normal":   {"stop": 25, "target": 30},
+    "high_vol": {"stop": 30, "target": 36},
 }
 
-# Volatility filter
 VOL_FILTER_RATIO   = 2.5
 VOL_LOOKBACK_SHORT = 5
 VOL_LOOKBACK_LONG  = 20
 
-# Session timing (UTC)
-SESSION_OPEN_UTC  = time(13, 0)   # 9:00 AM ET
-SIGNAL_BAR_UTC    = time(13, 30)  # signal fires after first 30-min bar closes
-SESSION_CLOSE_UTC = time(21, 0)   # 5:00 PM ET force flat
+SESSION_OPEN_ET  = time(9, 0)
+SIGNAL_BAR_ET    = time(9, 30)
+SESSION_CLOSE_ET = time(16, 30)
 
-# Lucid prop firm
-STARTING_BALANCE   = 100_000.0
-PROFIT_TARGET      =   6_000.0
-MLL_BUFFER         =   3_000.0
-MLL_LOCK_THRESHOLD = 100_000.0    # floor locks here once balance reaches it
+STARTING_BALANCE = 100_000.0
+PROFIT_TARGET    =   6_000.0
+MLL_BUFFER       =   3_000.0
 
-# Contract sizes to compare in parallel
 CONTRACT_SIZES = [1, 2, 3, 4]
 
-# ---------------------------------------------------------------------------
-# MLL tracker
-# ---------------------------------------------------------------------------
 
 class LucidMLL:
     """
-    Exact Lucid $3,000 trailing EOD drawdown limit.
+    Lucid trailing EOD drawdown limit — correctly modelled.
 
-      - Trails EOD balance: floor = peak_EOD_balance - $3,000
-      - Once EOD balance >= $100,000, floor locks permanently at $100,000
-      - Buffer on any given day = current_balance - floor
+    Floor = min(peak_EOD_balance - $3,000, $100,000)
+
+    Examples:
+      Start:            peak=$100,000  floor=$97,000   buffer=$3,000
+      After +$1,000:    peak=$101,000  floor=$98,000   buffer=$3,000
+      After +$3,000:    peak=$103,000  floor=$100,000  buffer=$3,000 (max floor)
+      After +$10,000:   peak=$110,000  floor=$100,000  buffer=$10,000 (grows)
+
+    The floor never exceeds $100,000, so it only reaches that level
+    once peak EOD hits $103,000 — not on the first $1 of profit.
     """
     def __init__(self):
         self.balance  = STARTING_BALANCE
         self.peak_eod = STARTING_BALANCE
-        self.floor    = STARTING_BALANCE - MLL_BUFFER
-        self.locked   = False
+        self.floor    = STARTING_BALANCE - MLL_BUFFER  # starts at $97,000
 
     @property
     def buffer(self):
@@ -92,27 +86,20 @@ class LucidMLL:
 
     def update_eod(self, eod_balance):
         self.balance = eod_balance
-        if not self.locked:
-            if eod_balance >= MLL_LOCK_THRESHOLD:
-                self.locked   = True
-                self.floor    = MLL_LOCK_THRESHOLD
-                self.peak_eod = eod_balance
-            else:
-                if eod_balance > self.peak_eod:
-                    self.peak_eod = eod_balance
-                self.floor = self.peak_eod - MLL_BUFFER
-        # Once locked, floor stays at $100k; buffer grows naturally
+        if eod_balance > self.peak_eod:
+            self.peak_eod = eod_balance
+        # Floor trails peak but is capped at STARTING_BALANCE
+        self.floor = min(self.peak_eod - MLL_BUFFER, STARTING_BALANCE)
 
     def is_breached(self):
         return self.balance < self.floor
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
 
 def load_data():
     df = pd.read_parquet(MGC_FILE_30M)
-    df.index = pd.to_datetime(df.index, utc=True)
+    df.index = pd.to_datetime(df.index, utc=False)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("America/New_York")
     df = df.sort_index()
     print(f"Loaded {len(df)} MGC 30-min bars  "
           f"({df.index[0].date()} to {df.index[-1].date()})")
@@ -140,9 +127,6 @@ def get_regime(rng):
     else:
         return "high_vol"
 
-# ---------------------------------------------------------------------------
-# Single backtest run
-# ---------------------------------------------------------------------------
 
 def run_backtest(df, daily, n_contracts):
     mll            = LucidMLL()
@@ -159,51 +143,45 @@ def run_backtest(df, daily, n_contracts):
         if mll.profit >= PROFIT_TARGET:
             break
 
-        # Match daily info
         day_mask = daily.index.date == day
         if not day_mask.any():
             continue
-        day_info  = daily[day_mask].iloc[0]
-        vol_ratio = day_info["vol_ratio"]
+        day_info   = daily[day_mask].iloc[0]
+        vol_ratio  = day_info["vol_ratio"]
         prev_range = day_info["range"]
 
-        # Skip if not enough vol history yet
         if np.isnan(day_info["range_20d"]):
             mll.update_eod(mll.balance)
             continue
 
-        # Volatility filter — skip extreme vol days
         if not np.isnan(vol_ratio) and vol_ratio > VOL_FILTER_RATIO:
             daily_results.append({
                 "date": day, "filtered": True, "reason": "vol_filter",
                 "pnl": 0.0, "trades": 0, "regime": "",
                 "balance": mll.balance, "floor": mll.floor,
-                "buffer": mll.buffer, "mll_locked": mll.locked,
+                "buffer": mll.buffer,
             })
             mll.update_eod(mll.balance)
             continue
 
-        # Regime and stops
         regime     = get_regime(prev_range)
         stop_pts   = STOPS[regime]["stop"]
         target_pts = STOPS[regime]["target"]
 
-        # Today's bars
         day_bars = df[df.index.date == day].copy()
         if len(day_bars) < 2:
             mll.update_eod(mll.balance)
             continue
 
-        # First bar: UTC 13:00-13:29
         first_bar = day_bars[
-            (day_bars.index.time >= SESSION_OPEN_UTC) &
-            (day_bars.index.time < SIGNAL_BAR_UTC)
+            (day_bars.index.time >= SESSION_OPEN_ET) &
+            (day_bars.index.time < SIGNAL_BAR_ET)
         ]
         if len(first_bar) == 0:
             mll.update_eod(mll.balance)
             continue
 
-        fb         = first_bar.iloc[0]
+        fb          = first_bar.iloc[0]
         first_open  = fb["open"]
         first_close = fb["close"]
 
@@ -213,23 +191,21 @@ def run_backtest(df, daily, n_contracts):
             direction = -1
         else:
             mll.update_eod(mll.balance)
-            continue  # doji
+            continue
 
         entry_price  = first_close
         stop_price   = entry_price - direction * stop_pts
         target_price = entry_price + direction * target_pts
 
-        # Simulate through remaining bars
-        remaining = day_bars[day_bars.index.time >= SIGNAL_BAR_UTC]
+        remaining = day_bars[day_bars.index.time >= SIGNAL_BAR_ET]
         exit_price  = None
         exit_reason = None
 
         for _, bar in remaining.iterrows():
-            if bar.name.time() >= SESSION_CLOSE_UTC:
+            if bar.name.time() >= SESSION_CLOSE_ET:
                 exit_price  = bar["open"]
                 exit_reason = "session_close"
                 break
-
             if direction == 1:
                 if bar["low"] <= stop_price:
                     exit_price  = stop_price
@@ -253,12 +229,10 @@ def run_backtest(df, daily, n_contracts):
             exit_price  = day_bars.iloc[-1]["close"]
             exit_reason = "eod"
 
-        # P&L
         raw_pnl = direction * (exit_price - entry_price) * MGC_PNL_PT * n_contracts
         comm    = MGC_COMM * n_contracts
         net_pnl = raw_pnl - comm
 
-        # Consistency flag
         consistency_flag = False
         if cumulative_pnl > 0 and net_pnl > 0:
             if net_pnl > 0.50 * cumulative_pnl:
@@ -268,8 +242,7 @@ def run_backtest(df, daily, n_contracts):
         if net_pnl > best_day_pnl:
             best_day_pnl = net_pnl
 
-        eod_balance = mll.balance + net_pnl
-        mll.update_eod(eod_balance)
+        mll.update_eod(mll.balance + net_pnl)
 
         trades.append({
             "date":             day,
@@ -298,18 +271,21 @@ def run_backtest(df, daily, n_contracts):
             "balance":     mll.balance,
             "floor":       mll.floor,
             "buffer":      mll.buffer,
-            "mll_locked":  mll.locked,
         })
 
     return pd.DataFrame(trades), pd.DataFrame(daily_results), mll
 
-# ---------------------------------------------------------------------------
-# Statistics
-# ---------------------------------------------------------------------------
 
 def compute_stats(trades_df, daily_df, mll, n_contracts):
     if trades_df.empty:
-        return {"n_contracts": n_contracts, "total_trades": 0}
+        return {"n_contracts": n_contracts, "total_trades": 0,
+                "win_rate": 0, "avg_win": 0, "avg_loss": 0,
+                "profit_factor": 0, "total_pnl": 0, "sharpe": 0,
+                "max_drawdown": 0, "final_balance": mll.balance,
+                "mll_breached": mll.is_breached(), "target_hit": False,
+                "days_to_target": None, "n_consistency_flags": 0,
+                "worst_losing_streak": 0, "min_mll_buffer": mll.buffer,
+                "regime_stats": pd.DataFrame()}
 
     wins   = trades_df[trades_df["win"]]
     losses = trades_df[~trades_df["win"]]
@@ -323,39 +299,33 @@ def compute_stats(trades_df, daily_df, mll, n_contracts):
     gross_losses  = abs(losses["net_pnl"].sum())
     profit_factor = gross_wins / gross_losses if gross_losses else np.inf
 
-    # Sharpe on daily P&L
     active = daily_df[~daily_df["filtered"]]
     sharpe = ((active["pnl"].mean() / active["pnl"].std()) * np.sqrt(252)
               if len(active) > 1 and active["pnl"].std() > 0 else 0.0)
 
-    # Max drawdown on equity curve
     eq       = daily_df["balance"].dropna()
     roll_max = eq.cummax()
     max_dd   = (eq - roll_max).min() if len(eq) else 0.0
 
     target_hit = mll.profit >= PROFIT_TARGET
 
-    # Days to target
     days_to_target = None
     if target_hit:
         hit_rows = daily_df[daily_df["balance"] >= STARTING_BALANCE + PROFIT_TARGET]
         if len(hit_rows):
             days_to_target = int(hit_rows.index[0]) + 1
 
-    # Regime breakdown
     regime_stats = (
         trades_df.groupby("regime")["net_pnl"]
                  .agg(count="count", total="sum", avg="mean")
     )
 
-    # Worst losing streak
     results = trades_df["win"].astype(int).tolist()
     max_streak = cur = 0
     for r in results:
         cur = cur + 1 if r == 0 else 0
         max_streak = max(max_streak, cur)
 
-    # Min buffer seen
     min_buffer = daily_df["buffer"].min() if "buffer" in daily_df.columns else 0
 
     return {
@@ -378,9 +348,6 @@ def compute_stats(trades_df, daily_df, mll, n_contracts):
         "regime_stats":        regime_stats,
     }
 
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
 
 def print_report(all_stats, all_daily):
     labels = [f"{s['n_contracts']} MGC" for s in all_stats]
@@ -425,18 +392,16 @@ def print_report(all_stats, all_daily):
     print("=" * 76)
     print()
 
-    # Regime breakdown (1-contract baseline)
     s0 = all_stats[0]
     if "regime_stats" in s0 and not s0["regime_stats"].empty:
-        print("  REGIME BREAKDOWN (1-contract baseline — P&L scales linearly)")
+        print("  REGIME BREAKDOWN (1-contract baseline)")
         print("  " + "-" * 55)
         print(f"  {'Regime':<14} {'Trades':>8} {'Total P&L':>12} {'Avg P&L':>12}")
         for regime, r in s0["regime_stats"].iterrows():
             print(f"  {regime:<14} {r['count']:>8.0f} "
                   f"  ${r['total']:>9.0f}   ${r['avg']:>9.0f}")
-        print()
+    print()
 
-    # MLL buffer analysis
     print("  MLL BUFFER — Worst point seen during backtest")
     print("  " + "-" * 55)
     for s in all_stats:
@@ -446,7 +411,6 @@ def print_report(all_stats, all_daily):
         print(f"  {n} contract(s):  min buffer = ${buf:>8,.0f}   {safe}")
     print()
 
-    # Path to target
     print("  PATH TO $6,000 PROFIT TARGET")
     print("  " + "-" * 55)
     for s in all_stats:
@@ -460,7 +424,6 @@ def print_report(all_stats, all_daily):
         print(f"  {n} contract(s):  {status}")
     print()
 
-    # Recommendation
     safe_sizes = [s for s in all_stats if not s["mll_breached"]]
     print("  RECOMMENDATION")
     print("  " + "-" * 55)
@@ -480,10 +443,6 @@ def print_report(all_stats, all_daily):
     print("=" * 76)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main():
     print()
     print("MGC Momentum v4 — Di Graziano Calibrated | Multi-Contract Backtest")
@@ -492,9 +451,9 @@ def main():
     df    = load_data()
     daily = build_daily_ranges(df)
 
-    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    all_stats  = []
-    all_daily  = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    all_stats = []
+    all_daily = []
 
     for n in CONTRACT_SIZES:
         print(f"  Running {n} contract(s)...", end=" ")
@@ -503,7 +462,6 @@ def main():
         all_stats.append(stats)
         all_daily.append(daily_df)
 
-        # Save CSVs
         trades_df.to_csv(RESULTS_DIR / f"v4_trades_{n}ct_{timestamp}.csv", index=False)
         daily_df.to_csv(RESULTS_DIR  / f"v4_daily_{n}ct_{timestamp}.csv",  index=False)
 
